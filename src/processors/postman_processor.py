@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Dict, List
 
 from src.models.api_path import APIPath
@@ -29,7 +30,8 @@ class PostmanProcessor(APIProcessor):
         requests = PostmanUtils.extract_requests(data, prefixes=self.config.prefixes)
         variables = PostmanUtils.extract_variables(data)
 
-        return APIDefinition(definitions=requests, variables=variables)
+        collection_name = (data.get("info") or {}).get("name")
+        return APIDefinition(definitions=requests, variables=variables, name=collection_name)
 
     def create_dot_env(self, api_definition: APIDefinition) -> None:
         self.logger.info("\nGenerating .env file...")
@@ -39,11 +41,37 @@ class PostmanProcessor(APIProcessor):
             self.logger.warning("⚠️ No environment variables found in Postman collection")
             env_vars = [{"key": "BASEURL", "value": ""}]
 
-        env_content = "\n".join(f"{var['key'].upper()}={var['value']}" for var in env_vars) + "\n"
+        # Also include placeholders for any Postman template variables referenced in URLs/bodies,
+        # since those frequently come from a Postman Environment (not embedded in the collection).
+        template_var_names: set[str] = set()
+        try:
+            for verb in api_definition.definitions or []:
+                full_path = getattr(verb, "full_path", "") or ""
+                raw_body = getattr(verb, "raw_body", "") or ""
+                for text in (full_path, raw_body):
+                    for m in re.findall(r"{{\s*([A-Za-z0-9_]+)\s*}}", text):
+                        template_var_names.add(m)
+        except Exception as e:
+            self.logger.debug(f"Could not extract template vars for .env: {e}")
+
+        def to_env_key(key: str) -> str:
+            k = (key or "").strip()
+            if k.lower() in {"base_url", "baseurl", "base-url", "base url"}:
+                return "BASEURL"
+            return k.upper()
+
+        existing_keys = {to_env_key(var.get("key", "")) for var in env_vars if isinstance(var, dict)}
+        for name in sorted(template_var_names):
+            key = to_env_key(name)
+            if key and key not in existing_keys:
+                env_vars.append({"key": key, "value": ""})
+                existing_keys.add(key)
+
+        env_content = "\n".join(f"{to_env_key(var['key'])}={var['value']}" for var in env_vars) + "\n"
         file_spec = FileSpec(path=".env", fileContent=env_content)
         self.file_service.create_files(self.config.destination_folder, [file_spec])
         self.logger.info(
-            f"Generated .env file with variables: {', '.join(var['key'].upper() for var in env_vars)}"
+            f"Generated .env file with variables: {', '.join(to_env_key(var['key']) for var in env_vars)}"
         )
 
     def get_api_paths(self, api_definition: APIDefinition) -> List[APIPath]:
@@ -139,10 +167,17 @@ class PostmanProcessor(APIProcessor):
             self.logger.error(f"Failed to update package.json: {e}")
 
     def _create_run_order_file(self, destination_folder: str, api_definition: APIDefinition):
-        lines = ["// This file runs the tests in order"]
-        for definition in api_definition.definitions:
-            if isinstance(definition, APIVerb):
-                lines.append(f'import "./{definition.file_path}.spec.ts";')
+        def sanitize(name: str) -> str:
+            n = (name or "").strip().lower()
+            n = re.sub(r"[^a-z0-9]+", "-", n)
+            n = re.sub(r"-+", "-", n).strip("-")
+            return n or "api-collection"
+
+        # Postman generation emits a single collection spec under src/tests.
+        collection_name = getattr(api_definition, "name", None) or "api-collection"
+        spec_base = sanitize(collection_name)
+        spec_path = f"./src/tests/{spec_base}.spec.ts"
+        lines = ["// This file runs the tests in order", f'import "{spec_path}";']
         file_spec = FileSpec(path="runTestsInOrder.js", fileContent="\n".join(lines))
         self.file_service.create_files(destination_folder, [file_spec])
         self.logger.info(f"Created runTestsInOrder.js at {destination_folder}")
